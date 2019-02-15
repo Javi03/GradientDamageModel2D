@@ -1,0 +1,527 @@
+#------------------------------------------------------------------------------------------
+#  Import libraries to get the code working.
+#------------------------------------------------------------------------------------------
+from dolfin import *
+from mshr import *
+import sys, os, sympy, shutil, math
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt 
+import socket
+import datetime
+
+#------------------------------------------------------------------------------------------
+# Parameters
+#------------------------------------------------------------------------------------------
+set_log_level(ERROR) # log level
+parameters.parse()   # read paramaters from command line
+
+# set some dolfin specific parameters
+parameters["form_compiler"]["optimize"]     = True
+parameters["form_compiler"]["cpp_optimize"] = True
+parameters["form_compiler"]["representation"] = "uflacs"
+
+
+#------------------------------------------------------------------------------------------
+# The linear solver requires parameters to get a suitable
+# performance. The following is a ddfault set of arrangements.
+#------------------------------------------------------------------------------------------                   
+solver_alpha_parameters =  {"method" : "gpcg", 
+                                    "linear_solver" : "gmres",
+                            #--------------------------------
+                            # These are parameters for optimization
+                            #--------------------------------
+                            "line_search": "armijo",
+                            #"preconditioner" : "bjacobi", 
+                            #"preconditioner" : "jacobi", 
+                            "preconditioner" : "hypre_euclid", 
+                            "maximum_iterations" :200,  
+                            "error_on_nonconvergence": False,
+                            #--------------------------------
+                            # These are parameters for linear solver
+                            #--------------------------------
+                            "krylov_solver" : {
+                                "maximum_iterations" : 200,
+                                "nonzero_initial_guess" : True,
+                                "report" : True,
+                                "monitor_convergence" : False,
+                                "relative_tolerance" : 1e-8
+                            }
+                           }                           
+                           
+solver_u_parameters =  {"linear_solver" : "cg", 
+                            "symmetric" : True, 
+                            #"preconditioner" : "bjacobi", 
+                            "preconditioner" : "jacobi", # ivan
+                            "krylov_solver" : {
+                                "report" : True,
+                                "monitor_convergence" : False,
+                                "relative_tolerance" : 1e-8 
+                                }
+                            }
+                            
+                            
+#------------------------------------------------------------------------------------------
+# Parameters to define the geometry
+# Geometry
+#------------------------------------------------------------------------------------------
+L = 1.;                # Large of the bar 
+H = 1.;               # Hight of the bar
+# The contours of geometry are
+# labeled with size "cell_size"
+cell_size = 0.01   
+modelo="lin"
+ejemplo= 3
+
+#------------------------------------------------------------------------------------------
+# Material constant
+#------------------------------------------------------------------------------------------
+E  = Constant(1.0)
+nu = Constant(0.3)
+#ell = Constant(0.001)
+k_ell = Constant(1.e-8) # residual stiffness
+#w1=7500.0
+Gc = 0.1
+
+
+#------------------------------------------------------------------------------------------
+#  The output time in the algorithm has related the following
+# parameters; "load_step" the upper bound of the time.
+#------------------------------------------------------------------------------------------
+load_steps = 40 # number of time steps
+load_min = 0. # initial time
+load_max = 2. # output time
+
+
+#------------------------------------------------------------------------------------------
+# Numerical parameters of the alternate minimization.
+# The algorithm stops when it reaches "maxiter" iterations,
+# or alternatively it stops when the error between two
+# sucessive iterations reaches the tolerance "toll".
+#------------------------------------------------------------------------------------------
+maxiter = 100 
+toll    = 1e-4 
+
+
+#------------------------------------------------------------------------------------------
+# Constitutive functions of the damage model. Here
+# we define the operators acting on the damage system
+# as well as the operator acting on the displacement
+# field, which depends on the damage.
+#------------------------------------------------------------------------------------------
+def w(alpha):
+    if modelo == "lin":
+        return alpha
+    if modelo == "quad":    
+        return  alpha**2
+
+def a(alpha):
+    return (1-alpha)**2
+
+#------------------------------------------------------------------------------------------
+# Geometry and mesh generation
+#------------------------------------------------------------------------------------------
+geom = Rectangle(Point(0., 0.), Point(L, H))
+hole1=Rectangle(Point(-0.1,0.48),Point(0.3,0.50)) # uncomment to add a hole
+hole2=Rectangle(Point(0.7,0.50),Point(1.1,0.52)) # uncomment to add a hole
+geom=geom-(hole1+hole2) # uncomment to add a hole
+
+mesh = Mesh()
+mesh_generator=CSGCGALMeshGenerator2D() 
+mesh_generator.parameters["mesh_resolution"] = -1. #
+mesh_generator.parameters["cell_size"] = cell_size #
+mesh = mesh_generator.generate(CSGCGALDomain2D(geom,50)) 
+
+print("--------------------------------------")
+ndim = mesh.geometry().dim() # get number of space dimensions
+h=CellDiameter(mesh) # diameters of all elements
+hmin=mesh.hmin() # minimum of all diameters
+print("minimun of all diameters=%.3g"%(hmin))
+hmax=mesh.hmax() # maximun of all diameters
+print("maximin of all diameters=%.3g"%(hmax))
+ellv = 5*hmax
+ell=ellv/sqrt(2.0)
+print("--------------------------------------")
+
+#------------------------------------------------------------------------------------------
+# The output is stored in a folder with path especified
+# in "savedir".
+# The files are stored in folder named "modelname".
+#------------------------------------------------------------------------------------------
+#ahora=datetime.datetime.now().strftime("%m-%d_%H.%M.%S")+'_'+socket.gethostname()
+modelname = "[ejemplo=%d][modelo=%s]_[ell=%.2g]_[Gc=%g]_[h_max=%.2g]"%(ejemplo,modelo,ellv,Gc,hmax)
+print(modelname)
+
+savedir = "results/%s"%(modelname)
+if os.path.isdir(savedir):
+    shutil.rmtree(savedir)
+
+    
+#------------------------------------------------------------------------------------------
+# Define boundary sets for boundary conditions
+#------------------------------------------------------------------------------------------
+class Left(SubDomain):
+    def inside(self, x, on_boundary):
+        return near(x[0], 0)
+        
+class Right(SubDomain):
+    def inside(self, x, on_boundary):
+        return near(x[0] , L)
+
+class Top(SubDomain):
+    def inside(self, x, on_boundary):
+        return near(x[1], H)
+        
+class Bottom(SubDomain):
+    def inside(self, x, on_boundary):
+        return near(x[1], 0.)
+              
+# Initialize sub-domain instances
+left        = Left() 
+right       = Right()
+top         = Top() 
+bottom      = Bottom()
+
+# define meshfunction to identify boundaries by numbers
+boundaries = FacetFunction("size_t", mesh)
+boundaries.set_all(0)
+left.mark  (boundaries, 1) # mark left as 1
+right.mark (boundaries, 2) # mark right as 2
+top.mark   (boundaries, 3) # mark top as 3
+bottom.mark(boundaries, 4) # mark bottom as 4
+
+# Define new measure including boundary naming
+# left: ds(1), right:  ds(2)
+# top : ds(3), bottom: ds(4)
+ds = Measure('ds', domain=mesh, subdomain_data=boundaries)
+dx = Measure('dx', domain=mesh)
+
+
+#------------------------------------------------------------------------------------------
+# Useful definitions
+#------------------------------------------------------------------------------------------
+# zero and unit vectors
+zero_v = Constant((0.,)*ndim)
+e1 = [Constant([1.,0.]),Constant((1.,0.,0.))][ndim-2]
+
+# Strain and stress
+def eps(v):
+    return sym(grad(v))
+    
+def sigma_0 ( eps):
+    mu    = E / ( 2.0 * ( 1.0 + nu))
+    lmbda = E * nu / ( 1.0 - nu**2)
+    return 2.0 * mu * ( eps) + lmbda * tr (eps ) * Identity ( ndim)
+
+# Fenics forms for the energies. This is affected by the damage in terms of the
+# modification of the Young modulus. As this relationship is linear, we can write it
+# as follows.    
+def sigma(eps,alpha):
+    return (a(alpha)+k_ell)*sigma_0(eps)
+
+# There is not influence of body forces.
+body_force = Constant((0.,0.))
+# Normalization constant for the dissipated energy 
+# to get Griffith surface energy for ell going to zero
+xi = sympy.Symbol("xi")
+c_w = float(4*sympy.integrate(sympy.sqrt(w(xi)),(xi,0,1)))
+
+#------------------------------------------------------------------------------------------
+# Variational formulation 
+#------------------------------------------------------------------------------------------
+# Create function space for 2D elasticity + Damage
+V_u     = VectorFunctionSpace(mesh, "CG", 1)
+V_alpha = FunctionSpace(mesh, "CG", 1)
+
+# Define the function, test and trial fields
+u, du, v = Function(V_u,name="u"), TrialFunction(V_u), TestFunction(V_u)
+alpha, dalpha, beta = Function(V_alpha,name="alpha"), TrialFunction(V_alpha), TestFunction(V_alpha)
+
+
+#------------------------------------------------------------------------------------------
+# Interpolate the initial condition for the damage alpha.
+#------------------------------------------------------------------------------------------
+alpha_0 = interpolate(Expression("0.0",degree=2), V_alpha) # initial (known) alpha
+
+a_1    =    0.1**2
+a_2    =    0.01**2
+initial_damage=0.0
+alpha_0_aux_1 = interpolate ( Expression("(pow(cos(theta)*(x[0]-0.5)+sin(theta)*(x[1]-0.5),2)/a_1+ \
+                                               pow(sin(theta)*(x[0]-0.5)-cos(theta)*(x[1]-0.5),2)/a_2)<=1 ? initial_damage : 0.",
+                                               degree = 2, a_1=a_1, a_2=a_2,theta=pi/4,initial_damage=initial_damage), V_alpha)
+                                         
+alpha_0.vector()[:]    =    alpha_0.vector()+alpha_0_aux_1.vector()
+
+alpha.assign(alpha_0)
+
+
+#------------------------------------------------------------------------------------------
+# Boudary conditions. Definiton of Dirichlet as well as homogeneous Neumann.
+# Notice that homegeneous Neumann b.c. are equivalent to omite any infomation
+# at boundaries.
+#------------------------------------------------------------------------------------------
+# Brief description about the set of boundary conditions for the displacement
+# field.
+#------------------------------------------------------------------------------------------
+# Dirichlet boundary condition.
+u_0 = zero_v
+Gamma_u_0 = DirichletBC ( V_u, u_0, boundaries, 4)
+
+u_1 = Expression(("-t"), degree = 2, t = 0.)
+Gamma_u_1 = DirichletBC ( V_u.sub(0), u_1, boundaries, 3)
+
+# bc - u 
+bc_u = [Gamma_u_0, Gamma_u_1]
+
+
+#------------------------------------------------------------------------------------------
+# Brief description about the set of boundary conditions for the damage.
+#------------------------------------------------------------------------------------------
+Gamma_alpha_0 = DirichletBC(V_alpha, 0.0, boundaries, 1)
+Gamma_alpha_1 = DirichletBC(V_alpha, 0.0, boundaries, 2)
+
+# bc - alpha 
+bc_alpha =[]# [Gamma_alpha_0,Gamma_alpha_1]
+
+
+#------------------------------------------------------------------------------------------
+# Let us define the total energy of the system as the sum of elastic energy,
+# dissipated energy due to the damage and external work due to body forces. 
+#------------------------------------------------------------------------------------------
+elastic_energy    = 0.5*inner(sigma(eps(u), alpha), eps(u))*dx
+
+external_work     = dot(body_force, u)*dx
+
+dissipated_energy = Gc/c_w*(w(alpha)/ell + ell*dot(grad(alpha), grad(alpha)))*dx #(w(alpha) + 0.5 * ell**2 * w1*dot ( grad ( alpha), grad ( alpha) ))  * dx
+
+total_energy = elastic_energy + dissipated_energy - external_work
+
+#------------------------------------------------------------------------------------------
+# Weak form of elasticity problem. This is the formal expression
+#------------------------------------------------------------------------------------------
+# for the tangent problem which gives us the equilibrium equations.
+E_u     = derivative(total_energy,u,v)
+E_alpha = derivative(total_energy,alpha,beta)
+
+# Hessian matrix
+E_alpha_alpha = derivative(E_alpha,alpha,dalpha)
+
+# Writing tangent problems in term of test and trial functions for matrix assembly
+E_du     = replace(E_u,{u:du})
+E_dalpha = replace(E_alpha,{alpha:dalpha})
+
+
+#------------------------------------------------------------------------------------------
+# Once the tangent problems are formulated in terms of trial and text functions,
+# we define the variatonal problems.
+#------------------------------------------------------------------------------------------
+# Variational problem for the displacement.
+problem_u     = LinearVariationalProblem ( lhs(E_du), rhs(E_du), u, bc_u)
+
+#------------------------------------------------------------------------------------------
+# For solving the damage we have two alternatives. Solve the equlibrium equation
+# or solve a constraint minimization algorithm.
+# If we solve the first order equilibrium, we need to create the variational formulation
+# from the tangent problem "E_alpha".
+
+# Variational problem for the damage (non-linear to use variational inequality solvers of petsc)
+class DamageProblem(OptimisationProblem):
+
+    def __init__(self): 
+        OptimisationProblem.__init__(self) 
+
+    # Objective vector    
+    def f(self, x):
+        alpha.vector()[:] = x
+        return assemble(total_energy)
+
+    # Gradient of the objective function
+    def F(self, b, x):
+        alpha.vector()[:] = x
+        assemble(E_alpha, tensor=b)        
+        #pass
+
+    # Hessian of the objective function    
+    def J(self, A, x):
+        alpha.vector()[:] = x
+        assemble(E_alpha_alpha, tensor=A)
+        #pass
+
+# The following line activates the optimization solver for the damage.     
+problem_alpha = DamageProblem()
+
+#------------------------------------------------------------------------------------------
+# Set up the solvers                                        
+solver_u = LinearVariationalSolver(problem_u)
+solver_u.parameters.update(solver_u_parameters)
+
+solver_alpha = PETScTAOSolver()
+solver_alpha.parameters.update(solver_alpha_parameters)
+
+lb = interpolate(Expression("0.", degree=2), V_alpha) # lower bound, set to 0 
+ub = interpolate(Expression("1.0", degree=2), V_alpha) # upper bound, set to 1 
+
+lb.vector()[:] = alpha.vector()  # important if alpha_0 \neq 0        
+
+
+#------------------------------------------------------------------------------------------
+#  loading and initialization of vectors to store time datas
+#------------------------------------------------------------------------------------------
+# we create a uniform distribution of "load_step" time steps.
+loadings   = np.linspace( load_min, load_max, load_steps)
+
+# The following matrices are created to store:
+energies   = np.zeros( ( len (loadings),4)) # The energy field
+iterations = np.zeros( ( len (loadings),2)) # The number of iterations
+forces     = np.zeros( ( len (loadings),2)) # The forces.
+alpha_max  = np.zeros( ( len (loadings),2)) # alpha max
+
+# create file to save alpha and u
+file_alpha = File(savedir+"/alpha.pvd") # use .pvd if .xdmf is not working
+file_u     = File(savedir+"/u.pvd") # use .pvd if .xdmf is not working
+# Solving at each timestep
+alpha_error = Function(V_alpha)
+
+
+#------------------------------------------------------------------------------------------
+#   Main loop.
+#------------------------------------------------------------------------------------------
+for (i_t, t) in enumerate(loadings):
+    # Apply BC to the lower and upper bounds
+    # As the constraints may change we have to
+    # apply the boundary condition at any interation loop.
+    for bc in bc_alpha:
+        bc.apply(lb.vector())
+        bc.apply(ub.vector())
+    
+    # Once the time level "t" is available, we have to update
+    # any function using it.
+    u_1.t = t
+    
+    # Alternate mininimization
+    # Initialization
+    iter = 1; err_alpha = 1
+    # Iterations of the alternate minimization stop if an error limit is
+    # reached or a maximim number of iterations have been done.
+    while err_alpha>toll and iter<maxiter:
+        #-----------------------------------------------------------------------------
+        # solve elastic problem
+        #-----------------------------------------------------------------------------
+        solver_u.solve()
+
+        #-----------------------------------------------------------------------------
+        # solve damage problem. This can be done in two forms, the first
+        # one is solving the equilibrium equation for the damage and the
+        # second one is via the use of aconstrained minmization algorithm.
+        #-----------------------------------------------------------------------------
+        #  Solver for optimization.    
+        solver_alpha.solve ( problem_alpha, alpha.vector(),lb.vector(), ub.vector())
+        alpha.vector()[alpha.vector() > 0.95] = 0.95  #alpha_max <= 0.95
+        
+        #-----------------------------------------------------------------------------
+        # Test the error, which is employed apply as assessment of one the
+        # stoped criteria.
+        #-----------------------------------------------------------------------------
+        # Compute the error vector.
+        alpha_error.vector()[:] = alpha.vector() - alpha_0.vector()       
+        # Compute the norm of the the error vector.
+        err_alpha = np.linalg.norm(alpha_error.vector().get_local(), ord = np.Inf)
+        # monitor the results
+        if mpi_comm_world().rank == 0:
+            print ("Iteration:  %2d, Error: %2.8g, alpha_max: %.8g" %(iter, err_alpha, alpha.vector().max()))
+
+        #-----------------------------------------------------------------------------   
+        # update the solution for the current alternate minimization iteration.
+        #-----------------------------------------------------------------------------
+        alpha_0.assign(alpha)
+
+        # update number of iteration
+        iter = iter + 1
+
+    #-----------------------------------------------------------------------------
+    # The alternate minimization algorithm has finished.   
+    #-----------------------------------------------------------------------------
+    # plot the damage fied
+    plot ( alpha, range_min = 0., range_max = 1., key = "alpha",title = "Damage at loading %.4f"%(t))
+    plt.savefig(savedir +"/alpha"+str(i_t)+"_"+str(t)+".png")
+
+    # updating the lower bound with the solution of the solution
+    # corresponding to the current global iteration it is to account
+    # for the irreversibility
+    lb.vector()[:] = alpha.vector()
+
+    #-----------------------------------------------------------------------------
+    # Some post-processing
+    #-----------------------------------------------------------------------------
+    # Save number of iterations for the time step, useful for plots.    
+    iterations[i_t] = np.array([t,iter])
+
+    # Calculate the energies
+    elastic_energy_value = assemble(elastic_energy)
+    surface_energy_value = assemble(dissipated_energy)
+    
+    if mpi_comm_world().rank == 0:
+        print("-----------------------------------------------------------")
+        print("\nEnd of timestep %d with load multiplier %g"%(i_t, t))
+        print( "\nElastic and surface energies: (%g,%g)" %( elastic_energy_value, surface_energy_value))
+        print("-----------------------------------------------------------")
+
+    # save the energies in the array    
+    energies[i_t] = np.array ( [ t, elastic_energy_value,surface_energy_value,
+                                 elastic_energy_value + surface_energy_value] )
+    
+    # calculate and save alpha_max                                              
+    alpha_max[i_t] = np.array([ t,alpha.vector().max() ] )                                                   
+    
+    # Dump the solution into files 
+    file_alpha << ( alpha, t) 
+    file_u     << ( u, t)
+    
+    # Save some global quantities as a function of the time 
+    np.savetxt(savedir + '/energies.txt', energies)
+    np.savetxt(savedir + '/iterations.txt', iterations)
+    np.savetxt(savedir + '/alpha.txt', alpha_max)
+
+
+#------------------------------------------------------------------------------------------
+# Plot energy and stresses
+#------------------------------------------------------------------------------------------
+def critical_stress():
+    xs = sympy.Symbol('x')
+    wx = w(xs); sx = 1/(E*H*a(xs));
+    res = sympy.sqrt(2*(Gc*H/c_w)*wx.diff(xs)/(sx.diff(xs)*ell))
+    return res.evalf(subs={xs:0})
+
+def plot_alpha():
+    plt.plot(alpha_max[:,0], alpha_max[:,1], 'b-o', linewidth = 2)
+    plt.xlabel('Displacement')
+    plt.ylabel('Damage')
+    force_cr = critical_stress()
+    plt.axvline(x = force_cr/(E*H)*L, color = 'grey', linestyle = '--', linewidth = 2)
+    plt.axhline(y = force_cr, color = 'grey', linestyle = '--', linewidth = 2)
+    
+def plot_energy():
+    p1, = plt.plot(energies[:,0], energies[:,1],'b-o',linewidth=2)
+    p2, = plt.plot(energies[:,0], energies[:,2],'r-o',linewidth=2)
+    p3, = plt.plot(energies[:,0], energies[:,3],'k--',linewidth=2)
+    plt.legend([p1, p2, p3], ["Elastic","Dissipated","Total"])
+    plt.xlabel('Displacement')
+    plt.ylabel('Energies')
+    force_cr = critical_stress()
+    plt.axvline(x = force_cr/(E*H)*L, color = 'grey', linestyle = '--', linewidth = 2)
+    plt.axhline(y = force_cr, color = 'grey', linestyle = '--', linewidth = 2)
+
+def plot_energy_stress():
+    plt.subplot(211)
+    plot_alpha()
+    plt.subplot(212)
+    plot_energy()
+    plt.savefig(savedir + '/energies_alpha.png')
+    plt.show()
+
+plot_energy_stress()
+
+#----------------------------------------------------------------
+#   End of the main program.
+#----------------------------------------------------------------
